@@ -7,7 +7,6 @@ from typing import Any
 
 import numpy as np
 import scipy
-import scipy.optimize
 
 from slowquant.molecularintegrals.integralfunctions import (
     one_electron_integral_transform,
@@ -28,7 +27,11 @@ from slowquant.unitary_coupled_cluster.operator_state_algebra import (
 from slowquant.unitary_coupled_cluster.operators import Epq, hamiltonian_0i_0a
 from slowquant.unitary_coupled_cluster.optimizers import Optimizers
 from slowquant.unitary_coupled_cluster.util import UpsStructure
-
+from slowquant.unitary_coupled_cluster.operators import (
+    G1,
+    G2,
+)
+from slowquant.unitary_coupled_cluster.util import iterate_t1, iterate_t2
 
 class WaveFunctionUPS:
     def __init__(
@@ -89,7 +92,8 @@ class WaveFunctionUPS:
         self._g_mo = None
         self._energy_elec: float | None = None
         self.ansatz_options = ansatz_options
-        self.num_energy_evals = 0
+        self.num_energy_evals = 0   # energy evaluations
+
         # Construct spin orbital spaces and indices
         active_space = []
         orbital_counter = 0
@@ -247,9 +251,14 @@ class WaveFunctionUPS:
                 # default option
                 self.ansatz_options["n_layers"] = 1
             self.ups_layout.create_SDSfUCC(self.num_active_orbs, self.num_active_elec, self.ansatz_options)
+        elif ansatz.lower() == "adapt":
+            None
         else:
             raise ValueError(f"Got unknown ansatz, {ansatz}")
-        self._thetas = np.zeros(self.ups_layout.n_params).tolist()
+        if self.ups_layout.n_params == 0 :
+            self._thetas = []
+        else: 
+            self._thetas = np.zeros(self.ups_layout.n_params).tolist()
 
     @property
     def kappa(self) -> list[float]:
@@ -266,7 +275,7 @@ class WaveFunctionUPS:
         self._h_mo = None
         self._g_mo = None
         self._energy_elec = None
-        self._kappa = k.copy()
+        self._kappa = k.copy().tolist()
         # Move current expansion point.
         self._c_mo = self.c_mo
         self._kappa_old = self.kappa
@@ -830,7 +839,8 @@ class WaveFunctionUPS:
         optimizer_name: str,
         orbital_optimization: bool = False,
         tol: float = 1e-10,
-        maxiter: int = 1000,
+        maxiter: int = 1000,       # the origianl is 1000
+        opt_last: bool = False,     # choose between full or partial optimization
     ) -> None:
         """Run one step optimization of wave function.
 
@@ -840,6 +850,7 @@ class WaveFunctionUPS:
             tol: Convergence tolerance.
             maxiter: Maximum number of iterations.
         """
+        #print(orbital_optimization)
         print("### Parameters information:")
         if orbital_optimization:
             print(f"### Number kappa: {len(self.kappa)}")
@@ -850,7 +861,7 @@ class WaveFunctionUPS:
                     "Cannot use RotoSolve together with orbital optimization in the one-step solver."
                 )
 
-        print("--------Iteration # | Iteration time [s] | Electronic energy [Hartree]")
+        print("------OP Iteration # | Iteration time [s] | Electronic energy [Hartree]")
         if orbital_optimization:
             if len(self.thetas) > 0:
                 energy = partial(
@@ -892,7 +903,15 @@ class WaveFunctionUPS:
                 parameters = self.kappa
         else:
             parameters = self.thetas
-        optimizer = Optimizers(energy, optimizer_name, grad=gradient, maxiter=maxiter, tol=tol)
+
+        # Choice between full opt and last parameter opt
+
+        if opt_last == False:
+            optimizer = Optimizers(energy, optimizer_name, grad=gradient, maxiter=maxiter, tol=tol)
+
+        elif opt_last == True:
+            optimizer = Optimizers(energy, optimizer_name, grad=gradient, maxiter=maxiter, tol=tol, params=self.thetas)
+
         self._old_opt_parameters = np.zeros_like(parameters) + 10**20
         self._E_opt_old = 0.0
         res = optimizer.minimize(
@@ -907,6 +926,105 @@ class WaveFunctionUPS:
         else:
             self.thetas = res.x.tolist()
         self._energy_elec = res.fun
+
+        print('CURRENT THETAS AFTER OPT', self.thetas)
+
+    
+    def do_adapt(self, maxiter=1000, epoch=1e-6 , orbital_opt: bool = False):    
+        excitation_pool: list[tuple[int, ...]] = []
+        excitation_pool_type: list[str] = []
+        for a, i in iterate_t1(self.active_occ_spin_idx, self.active_unocc_spin_idx):
+        #for a, i in iterate_t1_sa(self.active_occ_spin_idx, self.active_unocc_spin_idx):
+            excitation_pool.append((int(a),int(i)))            
+            excitation_pool_type.append("single")
+        for a, i, b, j in iterate_t2(self.active_occ_spin_idx, self.active_unocc_spin_idx):
+            print(a, i , b, j)
+            excitation_pool.append((i, j, a, b))
+            excitation_pool_type.append("double")
+        #print(self.ups_layout.excitation_indices)
+        #print(self.ups_layout.excitation_operator_type)
+        
+        
+        nloop = 0
+
+        for j in range(maxiter):
+            Hamiltonian = hamiltonian_0i_0a(
+                self.h_mo,
+                self.g_mo,
+                self.num_inactive_orbs,
+                self.num_active_orbs,
+            )
+            H_ket = propagate_state([Hamiltonian], self.ci_coeffs, self.ci_info, self.thetas, self.ups_layout)
+            grad = []
+            
+            for i in range(len(excitation_pool_type)):
+                if excitation_pool_type[i] == "single":
+                    (i, a) = np.array(excitation_pool[i]) 
+                    T = G1(i, a, True)
+                elif excitation_pool_type[i] == "double":
+                    (i, j, a, b) = np.array(excitation_pool[i]) 
+                    T = G2(i, j, a, b, True)
+                else:
+                    raise ValueError(f"Got unknown excitation type {excitation_pool[i]}")
+                gr = expectation_value(self.ci_coeffs,[T],  H_ket,
+                                    self.ci_info, self.thetas,self.ups_layout)
+                gr -= expectation_value(H_ket,[T],  self.ci_coeffs,
+                                    self.ci_info, self.thetas,self.ups_layout)
+                grad.append(gr)
+                
+            print()
+            print("------GP Printing Grad and Excitation Pool")
+            print("------GP #################################")
+            print(
+                    f"------GP{str("").center(72)}"
+                )
+            print(
+                    f"------GP{str("-----------------------------------------------------------------------------------").center(72)}"
+                )
+            print(
+                    f"------GP{str("Grad").center(27)} | {str("Excitation Pool indices").center(18)} | {str("Excitation Pool type").center(27)}"
+                )
+            for i in range(len(grad)):
+                
+                print(
+                    f"------GP{str(grad[i]).center(27)} | {str(excitation_pool[i]).center(18)} | {excitation_pool_type[i].center(27)}"
+                )
+
+            print()
+            print("### Index of Max grad :: ", end=" ")
+            print(np.argmax(np.abs(grad)))
+            print("### Number of excitation gradient > %e :: "%(epoch), end=" ")
+            print( (np.abs(grad) > epoch).sum())
+            max_arg = np.argmax(np.abs(grad))
+            if(np.max(np.abs(grad)) < epoch):
+                nloop = j
+                break
+            self.ups_layout.excitation_indices.append(np.array(excitation_pool[max_arg])-self.num_inactive_spin_orbs)
+            self.ups_layout.excitation_operator_type.append(excitation_pool_type[max_arg])
+            #del excitation_pool[max_arg]
+            #del excitation_pool_type[max_arg]
+            self.ups_layout.n_params += 1
+            excitation_pool = excitation_pool
+            excitation_pool_type = excitation_pool_type
+            
+            self._thetas.append(0.0)
+            self.run_wf_optimization_1step("bfgs", orbital_optimization=orbital_opt)
+            print()
+            print("------TP Printing the Optimised Theta")
+            print("------TP ############################")
+            
+            print(
+                    f"------TP {str("Thetas").center(27)} | {str("UPS Layout indices").center(18)} | {str("Excitation indices").center(18)} | {str("UPS Layout type").center(27)}"
+                )
+            for i in range(len(self._thetas)):
+                
+                print(
+                    f"------TP {str(self._thetas[i]).center(27)} | {str(self.ups_layout.excitation_indices[i]).center(18)} |{str(self.ups_layout.excitation_indices[i] + self.num_inactive_spin_orbs ).center(18)} | {self.ups_layout.excitation_operator_type[i].center(27)}"
+                )
+        print("------TP  Number of Loop", end = " ")
+        print(nloop)
+        
+        
 
     def _calc_energy_optimization(
         self, parameters: list[float], theta_optimization: bool, kappa_optimization: bool
@@ -946,7 +1064,10 @@ class WaveFunctionUPS:
             )
         self._E_opt_old = E
         self._old_opt_parameters = np.copy(parameters)
-        self.num_energy_evals += 1  # count one measurement
+
+        # Counting energy measurements
+        self.num_energy_evals += 1
+
         return E
 
     def _calc_gradient_optimization(
@@ -1028,7 +1149,8 @@ class WaveFunctionUPS:
                     self.thetas,
                     self.ups_layout,
                 )
-            self.num_energy_evals += 2 * np.sum(
-                list(self.ups_layout.grad_param_R.values())
-            )  # Count energy measurements for all gradients
+
+        # Counting gradient measurements -> phase shift
+        self.num_energy_evals += 2 * np.sum(list(self.ups_layout.grad_param_R.values()))  # Count energy measurements for all gradients
+        
         return gradient
